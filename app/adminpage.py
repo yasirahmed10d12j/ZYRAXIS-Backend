@@ -9,11 +9,25 @@ from html import escape
 
 
 def render(stats, settings, ollama_ok: bool, ollama_models: list, admin_key: str = "", connect: dict | None = None) -> str:
+    # Devices grouped by (ip, client): one iPhone opens a fresh session per
+    # chat turn (sessionId == requestId by design), so raw rows would spam
+    # one line per message. Group shows: client, ip, session count, last seen.
+    groups: dict = {}
+    for sid, d in stats.devices.items():
+        gkey = (d["ip"], d["model"])
+        g = groups.setdefault(gkey, {"n": 0, "last": "", "online": False, "sid": sid})
+        g["n"] += 1
+        if d["last"] >= g["last"]:
+            g["last"] = d["last"]
+            g["sid"] = sid
+        if sid in stats.peers:
+            g["online"] = True
     dev_rows = "".join(
-        "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
-        % (escape(sid), escape(d["ip"]), escape(d["model"]), escape(d["app"]), escape(d["last"]))
-        for sid, d in stats.devices.items()
-    ) or '<tr><td colspan="5">no devices yet — open the app and send a message</td></tr>'
+        "<tr><td>%s</td><td>%s</td><td>%d session%s%s</td><td>%s</td></tr>"
+        % (escape(model), escape(ip), g["n"], "" if g["n"] == 1 else "s",
+           " · ONLINE" if g["online"] else "", escape(g["last"]))
+        for (ip, model), g in groups.items()
+    ) or '<tr><td colspan="4">no devices yet — open the app and send a message</td></tr>'
 
     ip_rows = "".join(
         "<tr><td>%s</td><td>%d</td></tr>" % (escape(ip), n)
@@ -94,7 +108,7 @@ button.ghost{background:#1e293b;margin-left:8px}
 <div class="card"><b>%d</b><span>devices seen</span></div>
 </div>
 <h2>Devices</h2>
-<table><tr><th>session</th><th>ip</th><th>client</th><th>app</th><th>last seen</th></tr>%s</table>
+<table><tr><th>device</th><th>ip</th><th>sessions</th><th>last seen</th></tr>%s</table>
 <h2>Remote command → device</h2>
 <form method="post" action="/admin/cmd">
 <input type="hidden" name="key" value="%s">
