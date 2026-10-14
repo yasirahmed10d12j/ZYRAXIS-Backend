@@ -8,7 +8,7 @@ from __future__ import annotations
 from html import escape
 
 
-def render(stats, settings, ollama_ok: bool, ollama_models: list, admin_key: str = "") -> str:
+def render(stats, settings, ollama_ok: bool, ollama_models: list, admin_key: str = "", connect: dict | None = None) -> str:
     dev_rows = "".join(
         "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
         % (escape(sid), escape(d["ip"]), escape(d["model"]), escape(d["app"]), escape(d["last"]))
@@ -44,6 +44,17 @@ def render(stats, settings, ollama_ok: bool, ollama_models: list, admin_key: str
     )
     pend_html = ("<h2>Queued commands</h2><table><tr><th>device</th><th>waiting</th></tr>%s</table>" % pend_rows) if pend_rows else ""
 
+    connect = connect or {}
+    connect_html = """<h2>Connect a new iPhone</h2>
+<div class="cards"><div class="card" style="min-width:280px"><b style="font-size:15px">%s</b><span>1 · Settings → AI Backend → base URL</span></div>
+<div class="card" style="min-width:280px"><b style="font-size:15px">%s</b><span>2 · WebSocket URL</span></div>
+<div class="card" style="min-width:280px"><b style="font-size:15px">%s</b><span>3 · Backend API key → Save key → provider ZYRAXIS Backend</span></div></div>
+<div class="note">Same Wi-Fi/hotspot required. IP changes on hotspot restart — this card always shows the live one.</div>""" % (
+        escape(connect.get("base", "—")),
+        escape(connect.get("ws", "—")),
+        escape(connect.get("key", "—")),
+    )
+
     models = ", ".join(escape(m) for m in ollama_models) or "none pulled"
     order = ",".join(settings.provider_order)
     return """<!DOCTYPE html><html><head><meta charset="utf-8">
@@ -73,6 +84,7 @@ button.ghost{background:#1e293b;margin-left:8px}
 </style></head><body>
 <h1>⬡ ZYRAXIS Server</h1>
 <div class="sub">local control board · auto-refresh 30s · protocol v1</div>
+%s
 <div class="cards">
 <div class="card"><b>%s</b><span>uptime</span></div>
 <div class="card"><b>%d</b><span>WS connected now</span></div>
@@ -118,6 +130,7 @@ button.ghost{background:#1e293b;margin-left:8px}
 <h2>Recent events</h2>
 <table><tr><th>time</th><th>event</th></tr>%s</table>
 </body></html>""" % (
+        connect_html,
         escape(stats.uptime()),
         stats.ws_current,
         stats.rest_hits,

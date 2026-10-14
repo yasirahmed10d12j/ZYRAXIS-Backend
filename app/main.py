@@ -294,13 +294,50 @@ async def _ollama_status() -> tuple:
         return False, []
 
 
+def _lan_ip() -> str:
+    # Outbound interface address without sending traffic (UDP connect does
+    # no I/O). Falls back to "unavailable" offline — recomputed per page
+    # load because hotspot IPs change on restart.
+    import socket as _socket
+
+    try:
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    return "unavailable"
+
+
+def _connect_info() -> dict:
+    import os as _os
+
+    port = _os.environ.get("PUBLIC_PORT", "8000").strip() or "8000"
+    ip = _lan_ip()
+    keys = sorted(settings.backend_keys)
+    return {
+        "ip": ip,
+        "base": "http://%s:%s" % (ip, port) if ip != "unavailable" else "unavailable",
+        "ws": "ws://%s:%s/live" % (ip, port) if ip != "unavailable" else "unavailable",
+        # Shown only to key-holding admins (this page is 401 without it),
+        # so displaying one key adds no new exposure — and makes onboarding
+        # a new iPhone a copy-paste job.
+        "key": keys[0] if keys else "NOT SET — server denies everything",
+    }
+
+
 @app.get("/admin")
 async def admin(request: Request):
     if not _admin_key(request):
         return JSONResponse({"detail": "unauthorized"}, status_code=401)
     ok, models = await _ollama_status()
     key = request.query_params.get("key", "")
-    return HTMLResponse(render_admin(stats, settings, ok, models, key))
+    return HTMLResponse(render_admin(stats, settings, ok, models, key, _connect_info()))
 
 
 @app.post("/admin/config")

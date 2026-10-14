@@ -33,7 +33,11 @@ def test_admin_page_with_key():
     r = _client().get("/admin?key=%s" % KEY)
     assert r.status_code == 200
     assert "ZYRAXIS Server" in r.text
-    assert KEY not in r.text.split("hidden")[0]  # key not leaked in visible markup
+    # Connect card shows copy-ready onboarding values to the key-holding
+    # admin (no new exposure: the page itself is 401 without the key).
+    assert "Connect a new iPhone" in r.text
+    assert "ws://" in r.text and "/live" in r.text
+    assert KEY in r.text
 
 
 def test_admin_config_rejected_without_key(restore_settings):
@@ -69,6 +73,13 @@ def test_session_start_records_device():
     dev = main.stats.devices.get("sess-admin-1")
     assert dev is not None
     assert dev["model"] == "iPhone12,5"
+
+
+def test_connect_info_shape():
+    info = main._connect_info()
+    assert info["ws"].endswith("/live") or info["ws"] == "unavailable"
+    assert info["base"].startswith("http://") or info["base"] == "unavailable"
+    assert info["key"]  # fail-closed notice or a real key, never empty
 
 
 def test_rest_turn_mirrored_to_transcript(monkeypatch):
