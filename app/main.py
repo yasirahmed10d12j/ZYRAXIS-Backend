@@ -1,0 +1,395 @@
+"""ZYRAXIS backend — FastAPI service implementing the exact iOS wire contract.
+
+iOS contract sources (D:\\Projects\\ZYRAXIS-iOS):
+- REST   POST /api/{apiVersion}/chat  (BackendAIService.swift:98-103)
+- WS     envelopes {version,type,requestId,payload} (BackendProtocol.swift:114-151)
+- Auth   Authorization: Bearer <user key> on REST (BackendAIService.swift:267-274);
+         the iOS socket opens with NO auth headers (WebSocketManager.swift:80-92),
+         so WS auth is validate-if-present (see auth.check_ws_key).
+- Engine rules echoed here: UUID requestId echo (adapter requires it),
+  1-based strictly-increasing delta seq (ConversationManager.swift:234),
+  complete carries fullText (falls back to accumulated deltas).
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+import uuid
+
+from fastapi import FastAPI, Form, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+
+import httpx
+
+from . import providers as llm
+from .admin_stats import AdminStats, StatsLogHandler
+from .adminpage import render as render_admin
+from .auth import AuthError, check_bearer, check_ws_key
+from .config import get_settings
+from .protocol import (
+    PROTOCOL_VERSION,
+    assistant_complete,
+    assistant_delta,
+    assistant_error,
+    pong_frame,
+    remote_command_frame,
+)
+from .ratelimit import RateLimiter
+
+log = logging.getLogger("zyraxis")
+logging.basicConfig(level=logging.INFO)
+
+settings = get_settings()
+limiter = RateLimiter()
+stats = AdminStats()
+logging.getLogger("zyraxis").addHandler(StatsLogHandler(stats))
+
+# Largest accepted REST body (1 MiB). Starlette reads bodies unbounded by
+# default; on a 512 MB free instance an unbounded read is a trivial DoS.
+# WebSocket frames are already capped by the server's 1 MiB message limit.
+MAX_BODY_BYTES = 1048576
+
+app = FastAPI(title="ZYRAXIS backend", version="0.1.0")
+
+
+def _client_ip(headers, client) -> str:
+    try:
+        fwd = (headers.get("x-forwarded-for") or "")
+        if fwd:
+            return fwd.split(",")[0].strip()
+    except Exception:
+        pass
+    try:
+        return client.host
+    except Exception:
+        return "unknown"
+
+
+@app.get("/")
+async def root():
+    # Doubles as a warmup hit (Render spins up on HTTP).
+    return {"service": "zyraxis-backend", "version": "0.1.0", "protocol": PROTOCOL_VERSION}
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
+
+
+@app.post("/api/{api_version}/chat")
+async def chat(api_version: str, request: Request):
+    ip = _client_ip(request.headers, request.client)
+    stats.hit_ip(ip)
+    if not limiter.check_rest(ip):
+        stats.rest_errors += 1
+        return JSONResponse({"detail": "rate limited, retry later"}, status_code=429)
+    try:
+        check_bearer(request.headers.get("authorization"), settings.backend_keys)
+    except AuthError as e:
+        return JSONResponse({"detail": str(e)}, status_code=401)
+    try:
+        raw = await request.body()
+    except Exception:
+        return JSONResponse({"detail": "unreadable body"}, status_code=400)
+    if len(raw) > MAX_BODY_BYTES:
+        return JSONResponse({"detail": "body too large"}, status_code=413)
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return JSONResponse({"detail": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"detail": "invalid JSON body"}, status_code=400)
+    text = body.get("text", "")
+    if not isinstance(text, str) or not text.strip():
+        return JSONResponse({"detail": "missing 'text'"}, status_code=400)
+    if api_version != settings.api_version:
+        log.info("api-version chap=%s server=%s (serving anyway)", api_version, settings.api_version)
+    context = body.get("context") or {}
+    if not isinstance(context, dict):
+        context = {}
+    req_id = body.get("requestId") or str(uuid.uuid4())
+    try:
+        answer = await llm.generate_text(context=context, text=text, settings=settings)
+        stats.rest_hits += 1
+        stats.llm_ok += 1
+    except llm.RateLimitedError:
+        stats.rest_errors += 1
+        stats.llm_fail += 1
+        return JSONResponse({"detail": "provider rate limited"}, status_code=429)
+    except llm.ProviderAuthError:
+        stats.rest_errors += 1
+        stats.llm_fail += 1
+        return JSONResponse({"detail": "provider credentials rejected"}, status_code=502)
+    except llm.ProviderError:
+        stats.rest_errors += 1
+        stats.llm_fail += 1
+        return JSONResponse({"detail": "provider failure"}, status_code=502)
+    log.info("chat rid=%s chars=%d", req_id, len(answer))
+    stats.record_turn(ip, text, answer)
+    return {"text": answer, "toolCalls": [], "requestId": req_id}
+
+
+async def _send(websocket: WebSocket, frame: dict) -> None:
+    try:
+        await websocket.send_text(json.dumps(frame))
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+
+
+async def _run_turn(websocket: WebSocket, rid: str, text: str, context: dict, ip: str) -> None:
+    if not isinstance(text, str) or not text.strip():
+        await _send(websocket, assistant_error(rid, "EMPTY_MESSAGE", "empty message", False))
+        return
+    device = stats.peer_name(websocket) or ip
+    seq = 0
+    chunks: list = []
+    try:
+        async for piece in llm.generate_stream(context=context, text=text, settings=settings):
+            if not piece:
+                continue
+            seq += 1
+            chunks.append(piece)
+            await _send(websocket, assistant_delta(rid, piece, seq))
+    except asyncio.CancelledError:
+        return  # superseded/cancelled: client already moved on; stay silent
+    except llm.RateLimitedError:
+        stats.llm_fail += 1
+        await _send(websocket, assistant_error(rid, "RATE_LIMITED", "provider rate limited, retry later", True))
+        return
+    except llm.ProviderAuthError:
+        stats.llm_fail += 1
+        await _send(
+            websocket, assistant_error(rid, "PROVIDER_ERROR", "provider credentials rejected", False)
+        )
+        return
+    except llm.ProviderError:
+        stats.llm_fail += 1
+        await _send(websocket, assistant_error(rid, "PROVIDER_ERROR", "provider failure", True))
+        return
+    stats.llm_ok += 1
+    full = "".join(chunks)
+    stats.record_turn(device, text, full)
+    await _send(websocket, assistant_complete(rid, full, []))
+
+
+@app.websocket("/live")
+async def live(websocket: WebSocket):
+    await websocket.accept()
+    ip = _client_ip(websocket.headers, websocket.client)
+    if not limiter.check_ws_connect(ip):
+        await websocket.close(code=1013)
+        return
+    if not check_ws_key(websocket.query_params.get("key"), settings.backend_keys):
+        await websocket.close(code=1008, reason="unauthorized")
+        return
+    stats.ws_connects += 1
+    stats.ws_current += 1
+    stats.hit_ip(ip)
+    stats.event("ws open %s" % ip)
+    gen_task: asyncio.Task | None = None
+    try:
+        while True:
+            try:
+                raw = await websocket.receive_text()
+            except WebSocketDisconnect:
+                break
+            stats.ws_messages += 1
+            if not limiter.check_ws_message(ip):
+                continue  # drop flood, keep socket
+            try:
+                msg = json.loads(raw)
+            except ValueError:
+                continue  # malformed frame: tolerate + ignore
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("version") != PROTOCOL_VERSION:
+                rid = msg.get("requestId")
+                if isinstance(rid, str) and rid:
+                    await _send(
+                        websocket,
+                        assistant_error(rid, "VERSION_MISMATCH", "protocol mismatch", False),
+                    )
+                continue
+            mtype = msg.get("type")
+            rid = msg.get("requestId")
+            if not isinstance(rid, str) or not rid:
+                continue  # cannot route a reply; ignore
+            payload = msg.get("payload") or {}
+            if not isinstance(payload, dict):
+                payload = {}
+            if mtype == "session_start":
+                # Client self-emits .connected; no ack frame defined. But the
+                # handshake carries device identity — record it for /admin.
+                sid = payload.get("sessionId") or rid
+                stats.device_seen(sid, ip, payload)
+                stats.peers[sid] = websocket
+                stats.event("device %s %s" % (ip, payload.get("clientModel") or "?"))
+                queued = stats.pop_cmd(sid)
+                if queued is not None:
+                    await _send(websocket, remote_command_frame(str(uuid.uuid4()), queued))
+                    stats.event("flushed queued cmd to %s" % sid)
+                continue  # client self-emits .connected; no ack frame defined
+            if mtype == "user_message":
+                if gen_task is not None and not gen_task.done():
+                    gen_task.cancel()
+                text = payload.get("text", "")
+                context = payload.get("context") or {}
+                if not isinstance(context, dict):
+                    context = {}
+                gen_task = asyncio.create_task(_run_turn(websocket, rid, text, context, ip))
+                continue
+            if mtype == "session_end":
+                if gen_task is not None and not gen_task.done():
+                    gen_task.cancel()
+                continue
+            if mtype == "ping":
+                ts = payload.get("timestamp", time.time())
+                if not isinstance(ts, (int, float)):
+                    ts = time.time()
+                await _send(websocket, pong_frame(rid, ts))
+                continue
+            if mtype == "pong":
+                # Reply to a dashboard-initiated ping (see /admin/ping).
+                sent = stats.ping_sent.pop(rid, None)
+                ms = (time.time() - sent) * 1000 if sent else -1
+                stats.event("pong %s %dms" % (stats.peer_name(websocket) or ip, int(ms)))
+                continue
+            if mtype == "tool_result":
+                # v0.1 never sends tool_call, so this is unexpected; tolerate.
+                log.info("tool_result rid=%s tool=%s", rid, payload.get("toolName"))
+                continue
+            # Unknown types tolerated + ignored (forward compatibility).
+    finally:
+        if gen_task is not None and not gen_task.done():
+            gen_task.cancel()
+        limiter.release_ws(ip)
+        stats.ws_current = max(0, stats.ws_current - 1)
+        dead = [sid for sid, peer in stats.peers.items() if peer is websocket]
+        for sid in dead:
+            del stats.peers[sid]
+        stats.event("ws close %s" % ip)
+
+
+def _admin_key(request: Request) -> bool:
+    # Browser-friendly: ?key=... or Authorization header. Fail-closed:
+    # missing or wrong key is always denied (unlike the WS socket).
+    key = request.query_params.get("key")
+    if not key:
+        _, _, token = (request.headers.get("authorization") or "").partition(" ")
+        key = token.strip() or None
+    return bool(key) and bool(settings.backend_keys) and key in settings.backend_keys
+
+
+async def _ollama_status() -> tuple:
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(3.0)) as client:
+            resp = await client.get("http://localhost:11434/api/tags")
+        if resp.status_code != 200:
+            return False, []
+        names = [m.get("name", "?") for m in resp.json().get("models", [])]
+        return True, names
+    except Exception:
+        return False, []
+
+
+@app.get("/admin")
+async def admin(request: Request):
+    if not _admin_key(request):
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    ok, models = await _ollama_status()
+    key = request.query_params.get("key", "")
+    return HTMLResponse(render_admin(stats, settings, ok, models, key))
+
+
+@app.post("/admin/config")
+async def admin_config(
+    request: Request,
+    provider_order: str = Form(""),
+    max_output_tokens: str = Form("1024"),
+    temperature: str = Form("0.7"),
+    key: str = Form(""),
+):
+    global settings
+    from dataclasses import replace
+
+    # Form-posted key counts too (browsers can't set headers on plain forms).
+    if not _admin_key(request) and key not in settings.backend_keys:
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    order = tuple(p.strip().lower() for p in provider_order.split(",") if p.strip().lower() in ("local", "gemini", "groq"))
+    try:
+        max_tokens = max(64, min(4096, int(max_output_tokens)))
+    except ValueError:
+        max_tokens = settings.max_output_tokens
+    try:
+        temp = max(0.0, min(1.0, float(temperature)))
+    except ValueError:
+        temp = settings.temperature
+    settings = replace(
+        settings,
+        provider_order=order or settings.provider_order,
+        max_output_tokens=max_tokens,
+        temperature=temp,
+    )
+    stats.event("config updated: order=%s max=%d temp=%.2f" % (",".join(settings.provider_order), max_tokens, temp))
+    show = key or request.query_params.get("key", "")
+    return RedirectResponse("/admin?key=%s" % show if show else "/admin", status_code=303)
+
+
+def _redirect_back(key: str):
+    return RedirectResponse("/admin?key=%s" % key if key else "/admin", status_code=303)
+
+
+@app.post("/admin/cmd")
+async def admin_cmd(request: Request, device: str = Form(""), command: str = Form(""), key: str = Form("")):
+    if not _admin_key(request) and key not in settings.backend_keys:
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    show = key or request.query_params.get("key", "")
+    command = command.strip()[:200]
+    if not device or not command:
+        return _redirect_back(show)
+    peer = stats.peers.get(device)
+    if peer is not None:
+        try:
+            await peer.send_text(json.dumps(remote_command_frame(str(uuid.uuid4()), command)))
+            stats.event("remote cmd -> %s: %s" % (device, command))
+        except (WebSocketDisconnect, RuntimeError):
+            stats.queue_cmd(device, command)
+            stats.event("device gone, queued for %s: %s" % (device, command))
+    else:
+        stats.queue_cmd(device, command)
+        stats.event("queued for offline %s: %s (runs on next session_start)" % (device, command))
+    return _redirect_back(show)
+
+
+@app.post("/admin/ping")
+async def admin_ping(request: Request, device: str = Form(""), key: str = Form("")):
+    if not _admin_key(request) and key not in settings.backend_keys:
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    show = key or request.query_params.get("key", "")
+    peer = stats.peers.get(device)
+    if peer is not None:
+        rid = str(uuid.uuid4())
+        stats.ping_sent[rid] = time.time()
+        try:
+            await peer.send_text(json.dumps(
+                {"version": PROTOCOL_VERSION, "type": "ping",
+                 "requestId": rid, "payload": {"timestamp": time.time()}}))
+            stats.event("ping -> %s (watch for pong)" % device)
+        except (WebSocketDisconnect, RuntimeError):
+            stats.event("ping failed, %s offline" % device)
+    else:
+        stats.event("ping failed, %s offline" % device)
+    return _redirect_back(show)
+
+
+@app.post("/admin/clear")
+async def admin_clear(request: Request, key: str = Form("")):
+    if not _admin_key(request) and key not in settings.backend_keys:
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    show = key or request.query_params.get("key", "")
+    stats.transcript.clear()
+    stats.events.clear()
+    stats.event("dashboard cleared by admin")
+    return _redirect_back(show)

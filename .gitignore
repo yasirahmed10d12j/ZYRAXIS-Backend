@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Local secrets — never commit (see .env.example for the shape)
+.env
+
+# OS / editor
+.DS_Store
+Thumbs.db

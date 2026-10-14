@@ -1,0 +1,33 @@
+# Render Blueprint — declares (does NOT create) one FREE web service.
+# Nothing is deployed until YOU approve and either apply this file or create
+# the service manually (see README §5). Never add a payment method for this.
+services:
+  - type: web
+    name: zyraxis-backend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
+      - key: PROVIDER_ORDER
+        value: gemini,groq
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash-lite
+      - key: GROQ_MODEL
+        value: llama-3.1-8b-instant
+      - key: API_VERSION
+        value: v1
+      - key: MAX_OUTPUT_TOKENS
+        value: 1024
+      - key: TEMPERATURE
+        value: 0.7
+      # Secrets below: fill in the Render Dashboard (sync: false = manual entry).
+      - key: BACKEND_API_KEYS
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
