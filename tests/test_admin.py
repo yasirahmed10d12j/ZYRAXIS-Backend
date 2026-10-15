@@ -135,3 +135,90 @@ def test_clear_empties_transcript(monkeypatch):
     r = _client().post("/admin/clear?key=%s" % KEY, data={"key": KEY})
     assert r.status_code in (200, 303)
     assert len(main.stats.transcript) == 0
+
+
+@pytest.fixture
+def isolated_hub(tmp_path, monkeypatch):
+    from app.syncstore import MemoryStore, TaskStore
+    monkeypatch.setattr("app.main.memory_store", MemoryStore(str(tmp_path / "m.json")))
+    monkeypatch.setattr("app.main.task_store", TaskStore(str(tmp_path / "t.json")))
+
+
+def test_export_downloads_transcript(monkeypatch, isolated_hub):
+    async def fake_text(*, context, text, settings):
+        return "export me"
+
+    monkeypatch.setattr("app.main.llm.generate_text", fake_text)
+    _client().post("/api/v1/chat", json={"text": "hello export"},
+                   headers={"Authorization": "Bearer %s" % KEY})
+    r = _client().get("/admin/export?key=%s" % KEY)
+    assert r.status_code == 200
+    assert "hello export" in r.text and "export me" in r.text
+    assert _client().get("/admin/export").status_code == 401
+
+
+def test_broadcast_reaches_live_device():
+    rid = "99999999-9999-9999-9999-999999999999"
+    frame = json.dumps({"version": 1, "type": "session_start", "requestId": rid,
+                        "payload": {"sessionId": "sess-bc-1"}})
+    with _client().websocket_connect("/live") as ws:
+        ws.send_text(frame)
+        r = _client().post("/admin/broadcast?key=%s" % KEY,
+                           data={"command": "open youtube", "key": KEY})
+        assert r.status_code in (200, 303)
+        got = json.loads(ws.receive_text())
+    assert got["type"] == "remote_command"
+    assert got["payload"] == {"command": "open youtube"}
+
+
+def test_note_and_task_from_dashboard(isolated_hub):
+    c = _client()
+    assert c.post("/admin/note?key=%s" % KEY, data={"content": "dash note", "key": KEY}).status_code in (200, 303)
+    assert c.post("/admin/task?key=%s" % KEY, data={"title": "dash task", "key": KEY}).status_code in (200, 303)
+    mems = c.get("/api/v1/memory", params={"query": "dash note"},
+                 headers={"Authorization": "Bearer %s" % KEY}).json()["memories"]
+    assert len(mems) == 1
+    tasks = c.get("/api/v1/tasks", params={"filter": "active"},
+                  headers={"Authorization": "Bearer %s" % KEY}).json()["tasks"]
+    assert any(t["title"] == "dash task" for t in tasks)
+    assert c.post("/admin/note", data={"content": "x"}).status_code == 401
+    assert c.post("/admin/task", data={"title": "x"}).status_code == 401
+    assert c.post("/admin/broadcast", data={"command": "x"}).status_code == 401
+
+
+def test_model_unload_calls_ollama(monkeypatch):
+    calls = []
+
+    class FakeResp:
+        status_code = 200
+
+        def json(self):
+            return {"models": []}
+
+    class FakeCM:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, **kwargs):
+            calls.append(url)
+            return FakeResp()
+
+        async def get(self, url, **kwargs):
+            calls.append(url)
+            return FakeResp()
+
+    class FakeHttpx:
+        def AsyncClient(self, *a, **k):
+            return FakeCM()
+
+        def Timeout(self, *a, **k):
+            return None
+
+    monkeypatch.setattr("app.main.httpx", FakeHttpx())
+    r = _client().post("/admin/model-unload?key=%s" % KEY, data={"key": KEY})
+    assert r.status_code in (200, 303)
+    assert any("/api/generate" in u for u in calls)
+    assert _client().post("/admin/model-unload", data={}).status_code == 401

@@ -1,7 +1,7 @@
-"""Admin dashboard page (single-file HTML, zero JS dependencies).
+"""Admin dashboard page (single-file HTML, zero dependencies).
 
-Dark ZYRAXIS-styled status board: server health, connected devices,
-runtime config form, recent events. Auto-refreshes every 30 s.
+Dark ZYRAXIS control-board aesthetic: glass cards, cyan glow accents,
+copy-ready connect values. Auto-refreshes every 30 s.
 """
 from __future__ import annotations
 
@@ -9,24 +9,10 @@ from html import escape
 
 
 def render(stats, settings, ollama_ok: bool, ollama_models: list, admin_key: str = "", connect: dict | None = None, hub: dict | None = None) -> str:
-    # Devices grouped by (ip, client): one iPhone opens a fresh session per
-    # chat turn (sessionId == requestId by design), so raw rows would spam
-    # one line per message. Group shows: client, ip, session count, last seen.
-    groups: dict = {}
-    for sid, d in stats.devices.items():
-        gkey = (d.get("ip", "?"), d.get("model", "?"))
-        g = groups.setdefault(gkey, {"n": 0, "last": "", "online": False, "name": d.get("name", "?")})
-        g["n"] += 1
-        if d.get("last", "") >= g["last"]:
-            g["last"] = d.get("last", "")
-            g["name"] = d.get("name", "?")
-        if sid in stats.peers:
-            g["online"] = True
     dev_rows = "".join(
-        "<tr><td>%s</td><td>%s</td><td>%s</td><td>%d session%s%s</td><td>%s</td></tr>"
-        % (escape(g["name"]), escape(model), escape(ip), g["n"], "" if g["n"] == 1 else "s",
-           " · ONLINE" if g["online"] else "", escape(g["last"]))
-        for (ip, model), g in groups.items()
+        "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+        % (escape(sid), escape(d["ip"]), escape(d["model"]), escape(d["app"]), escape(d["last"]))
+        for sid, d in stats.devices.items()
     ) or '<tr><td colspan="5">no devices yet — open the app and send a message</td></tr>'
 
     ip_rows = "".join(
@@ -45,16 +31,11 @@ def render(stats, settings, ollama_ok: bool, ollama_models: list, admin_key: str
         for t in stats.transcript
     ) or '<tr><td colspan="4">no chats yet — send a message from the app</td></tr>'
 
-    def _device_online(did, info):
-        if did in stats.peers:
-            return True
-        return any(s in stats.peers for s in info.get("sessions", []))
-
     dev_opts = "".join(
-        '<option value="%s">%s (%s · %s)%s</option>'
-        % (escape(did), escape(info.get("name", "?")), escape(info.get("model", "?")), escape(info.get("ip", "?")),
-           " · ONLINE" if _device_online(did, info) else "")
-        for did, info in stats.devices.items()
+        '<option value="%s">%s (%s)%s</option>'
+        % (escape(sid), escape(d["model"]), escape(d["ip"]),
+           " · ONLINE" if sid in stats.peers else "")
+        for sid, d in stats.devices.items()
     ) or '<option value="">no devices yet</option>'
 
     pend_rows = "".join(
@@ -63,45 +44,52 @@ def render(stats, settings, ollama_ok: bool, ollama_models: list, admin_key: str
     )
     pend_html = ("<h2>Queued commands</h2><table><tr><th>device</th><th>waiting</th></tr>%s</table>" % pend_rows) if pend_rows else ""
 
-    connect = connect or {}
-    connect_html = """<h2>Connect a new iPhone</h2>
-<div class="cards"><div class="card" style="min-width:280px"><b style="font-size:15px">%s</b><span>1 · Settings → AI Backend → base URL</span></div>
-<div class="card" style="min-width:280px"><b style="font-size:15px">%s</b><span>2 · WebSocket URL</span></div>
-<div class="card" style="min-width:280px"><b style="font-size:15px">%s</b><span>3 · Backend API key → Save key → provider ZYRAXIS Backend</span></div></div>
-<div class="note">Same Wi-Fi/hotspot required. IP changes on hotspot restart — this card always shows the live one.</div>""" % (
-        escape(connect.get("base", "—")),
-        escape(connect.get("ws", "—")),
-        escape(connect.get("key", "—")),
-    )
-
     models = ", ".join(escape(m) for m in ollama_models) or "none pulled"
     order = ",".join(settings.provider_order)
+    c = connect or {}
+    connect_html = connect_card(c.get("base", "—"), c.get("ws", "—"), c.get("key", "—"))
     return """<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta http-equiv="refresh" content="30">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ZYRAXIS Server</title>
 <style>
-body{background:#0a0e14;color:#c9e6f2;font-family:Segoe UI,system-ui,sans-serif;margin:0;padding:16px}
-h1{color:#22d3ee;font-size:22px;margin:0 0 4px}.sub{color:#64748b;font-size:13px;margin-bottom:16px}
-.cards{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
-.card{background:#111827;border:1px solid #1e293b;border-radius:10px;padding:12px 16px;min-width:130px}
-.card b{display:block;font-size:22px;color:#fff}.card span{font-size:12px;color:#64748b}
-.ok{color:#4ade80}.bad{color:#f87171}
-table{width:100%%;border-collapse:collapse;margin:8px 0 20px;font-size:14px}
-th,td{text-align:left;padding:8px;border-bottom:1px solid #1e293b}
-th{color:#64748b;font-size:12px;text-transform:uppercase}
-h2{font-size:16px;color:#22d3ee;margin:20px 0 4px}
-form{background:#111827;border:1px solid #1e293b;border-radius:10px;padding:14px}
-label{display:block;font-size:13px;color:#94a3b8;margin:8px 0 4px}
-input{background:#0a0e14;border:1px solid #334155;color:#fff;border-radius:6px;padding:8px;width:100%%;max-width:420px;box-sizing:border-box}
-select{background:#0a0e14;border:1px solid #334155;color:#fff;border-radius:6px;padding:8px;max-width:420px}
-button{background:#0891b2;color:#fff;border:0;border-radius:6px;padding:9px 20px;margin-top:12px;cursor:pointer;font-size:14px}
-button:hover{background:#06b6d4}
-button.ghost{background:#1e293b;margin-left:8px}
-.note{font-size:12px;color:#64748b;margin-top:10px}
-.warn{font-size:12px;color:#fbbf24;margin-top:8px}
+:root{--bg:#070b12;--panel:#0e1622;--line:#1c2a3d;--txt:#d7ecf7;--dim:#7d93a8;--cy:#22d3ee;--cy2:#0891b2;--ok:#4ade80;--bad:#f87171;--warn:#fbbf24}
+*{box-sizing:border-box}
+body{background:radial-gradient(1200px 600px at 20%% -10%%,#0e2233 0%%,var(--bg) 55%%);color:var(--txt);font-family:'Segoe UI',system-ui,sans-serif;margin:0;padding:20px;max-width:1100px;margin-left:auto;margin-right:auto}
+.top{display:flex;align-items:center;gap:12px;margin-bottom:2px}
+.logo{width:38px;height:38px;border-radius:10px;background:linear-gradient(135deg,#0e3a46,#08202a);border:1px solid var(--line);display:flex;align-items:center;justify-content:center;color:var(--cy);font-size:20px;box-shadow:0 0 18px rgba(34,211,238,.25)}
+h1{color:#fff;font-size:22px;margin:0;letter-spacing:.5px}
+.sub{color:var(--dim);font-size:12.5px;margin:2px 0 16px 50px}
+.dot{width:9px;height:9px;border-radius:50%%;background:var(--ok);box-shadow:0 0 10px var(--ok);animation:pulse 2s infinite}
+@keyframes pulse{50%%{opacity:.45}}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-bottom:6px}
+.card{background:linear-gradient(180deg,#101b29,#0c1420);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+.card b{display:block;font-size:21px;color:#fff;font-variant-numeric:tabular-nums}
+.card span{font-size:11.5px;color:var(--dim)}
+.ok{color:var(--ok)}.bad{color:var(--bad)}
+table{width:100%%;border-collapse:collapse;margin:8px 0 20px;font-size:13.5px;background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line)}
+tr:last-child td{border-bottom:0}
+th{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.8px;background:#0b1320}
+td.mono{font-family:Consolas,monospace;font-size:12.5px}
+h2{font-size:15px;color:var(--cy);margin:22px 0 6px;letter-spacing:.4px}
+form{background:linear-gradient(180deg,#101b29,#0c1420);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+label{display:block;font-size:12.5px;color:var(--dim);margin:10px 0 4px}
+input,select{background:#070d16;border:1px solid #2b3f55;color:#fff;border-radius:8px;padding:9px 10px;width:100%%;max-width:460px}
+input:focus,select:focus{outline:none;border-color:var(--cy2)}
+button{background:linear-gradient(180deg,#0ea5c4,#087a94);color:#fff;border:0;border-radius:8px;padding:9px 22px;margin-top:12px;cursor:pointer;font-size:14px;font-weight:600}
+button:hover{filter:brightness(1.15)}
+button.ghost{background:#1a2635;margin-left:8px}
+button.copy{padding:5px 12px;font-size:12px;margin:0 0 0 8px}
+.note{font-size:12px;color:var(--dim);margin-top:10px}
+.warn{font-size:12px;color:var(--warn);margin-top:8px}
+.conn{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px;margin-bottom:4px}
+.connbox{background:linear-gradient(180deg,#10202f,#0c1622);border:1px solid #23465c;border-radius:12px;padding:12px 14px}
+.connbox code{display:block;font-family:Consolas,monospace;font-size:14px;color:#fff;word-break:break-all}
+.connbox span{font-size:11.5px;color:var(--dim)}
+.step{color:var(--cy);font-weight:700;margin-right:6px}
 </style></head><body>
-<h1>⬡ ZYRAXIS Server</h1>
+<div class="top"><div class="logo">⬡</div><h1>ZYRAXIS Server</h1><div class="dot"></div></div>
 <div class="sub">local control board · auto-refresh 30s · protocol v1</div>
 %s
 <div class="cards">
@@ -111,11 +99,9 @@ button.ghost{background:#1e293b;margin-left:8px}
 <div class="card"><b>%d / %d</b><span>LLM ok / fail</span></div>
 <div class="card"><b class="%s">%s</b><span>Ollama (%s)</span></div>
 <div class="card"><b>%d</b><span>devices seen</span></div>
-<div class="card"><b>%d</b><span>shared memories</span></div>
-<div class="card"><b>%d</b><span>active tasks</span></div>
 </div>
 <h2>Devices</h2>
-<table><tr><th>name</th><th>device</th><th>ip</th><th>sessions</th><th>last seen</th></tr>%s</table>
+<table><tr><th>session</th><th>ip</th><th>client</th><th>app</th><th>last seen</th></tr>%s</table>
 <h2>Remote command → device</h2>
 <form method="post" action="/admin/cmd">
 <input type="hidden" name="key" value="%s">
@@ -127,12 +113,32 @@ button.ghost{background:#1e293b;margin-left:8px}
 <button class="ghost" type="submit" formaction="/admin/ping" formmethod="post">Ping device</button></div>
 <div class="warn">Offline device? Command queues and runs on its next session. Executing on the iPhone needs the client update — until then sends are safely ignored there.</div>
 </form>
+<form method="post" action="/admin/broadcast" style="margin-top:10px">
+<input type="hidden" name="key" value="%s">
+<label>Broadcast to ALL connected devices at once</label>
+<input name="command" placeholder="open youtube" maxlength="200">
+<div><button type="submit">Broadcast</button></div>
+</form>
 %s
 <h2>Live transcript (device ⇄ server mirror)</h2>
 <table><tr><th>time</th><th>device</th><th>request</th><th>reply</th></tr>%s</table>
 <form method="post" action="/admin/clear" style="background:none;border:0;padding:0">
 <input type="hidden" name="key" value="%s">
 <button class="ghost" type="submit">Clear transcript + events</button>
+</form>
+<div style="margin-top:8px"><a href="/admin/export?key=%s" style="color:#22d3ee;font-size:13px">⬇ Download transcript (.txt)</a></div>
+<h2>Quick add (shared hub — all devices see it)</h2>
+<form method="post" action="/admin/note">
+<input type="hidden" name="key" value="%s">
+<label>Memory note</label>
+<input name="content" placeholder="Rehan's birthday is June 5" maxlength="2000">
+<div><button type="submit">Save note</button></div>
+</form>
+<form method="post" action="/admin/task" style="margin-top:10px">
+<input type="hidden" name="key" value="%s">
+<label>Task</label>
+<input name="title" placeholder="Pay bill" maxlength="300">
+<div><button type="submit">Add task</button></div>
 </form>
 <h2>Runtime config</h2>
 <form method="post" action="/admin/config">
@@ -146,10 +152,19 @@ button.ghost{background:#1e293b;margin-left:8px}
 <button type="submit">Apply (no restart)</button>
 <div class="note">Keys stay in environment — never shown or edited here.</div>
 </form>
+<h2>Model RAM</h2>
+<form method="post" action="/admin/model-unload">
+<input type="hidden" name="key" value="%s">
+<div class="note">Unload the local model from RAM (frees ~2GB on this 8GB laptop). The next chat reloads it automatically (slow first reply).</div>
+<div><button type="submit">Unload model</button></div>
+</form>
 <h2>Requests per IP</h2>
 <table><tr><th>ip</th><th>hits</th></tr>%s</table>
 <h2>Recent events</h2>
 <table><tr><th>time</th><th>event</th></tr>%s</table>
+<script>
+function copyVal(id){var el=document.getElementById(id);var t=el?el.textContent:'';if(navigator.clipboard){navigator.clipboard.writeText(t);}else{var ta=document.createElement('textarea');ta.value=t;document.body.appendChild(ta);ta.select();try{document.execCommand('copy');}catch(e){}ta.remove();}}
+</script>
 </body></html>""" % (
         connect_html,
         escape(stats.uptime()),
@@ -161,18 +176,32 @@ button.ghost{background:#1e293b;margin-left:8px}
         "UP" if ollama_ok else "DOWN",
         escape(models),
         len(stats.devices),
-        (hub or {}).get("memories", 0),
-        (hub or {}).get("tasks", 0),
         dev_rows,
         escape(admin_key),
         dev_opts,
+        escape(admin_key),
         pend_html,
         turn_rows,
+        escape(admin_key),
+        escape(admin_key),
+        escape(admin_key),
         escape(admin_key),
         escape(admin_key),
         escape(order),
         settings.max_output_tokens,
         settings.temperature,
+        escape(admin_key),
         ip_rows,
         event_rows,
     )
+
+
+def connect_card(base, ws, key):
+    return """<h2>Connect a new iPhone</h2>
+<div class="conn">
+<div class="connbox"><code id="cv-base">%s</code><span><span class="step">1 ·</span>Settings → AI Backend → base URL</span> <button class="copy" onclick="copyVal('cv-base')">Copy</button></div>
+<div class="connbox"><code id="cv-ws">%s</code><span><span class="step">2 ·</span>WebSocket URL</span> <button class="copy" onclick="copyVal('cv-ws')">Copy</button></div>
+<div class="connbox"><code id="cv-key">%s</code><span><span class="step">3 ·</span>Backend API key → Save → ZYRAXIS Backend</span> <button class="copy" onclick="copyVal('cv-key')">Copy</button></div>
+</div>
+<div class="note">Same Wi-Fi/hotspot required. IP changes on hotspot restart — this card always shows the live one.</div>""" % (
+        escape(base), escape(ws), escape(key))

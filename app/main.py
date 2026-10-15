@@ -404,6 +404,89 @@ def _redirect_back(key: str):
     return RedirectResponse("/admin?key=%s" % key if key else "/admin", status_code=303)
 
 
+@app.get("/admin/export")
+async def admin_export(request: Request):
+    if not _admin_key(request):
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    lines = ["ZYRAXIS transcript export"]
+    for t in list(stats.transcript)[::-1]:
+        lines.append("[%s] %s | Q: %s" % (t["t"], t["dev"], t["q"]))
+        lines.append("[%s] %s | A: %s" % (t["t"], t["dev"], t["a"]))
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse("\n".join(lines) + "\n",
+                             headers={"Content-Disposition": "attachment; filename=zyraxis-transcript.txt"})
+
+
+@app.post("/admin/broadcast")
+async def admin_broadcast(request: Request, command: str = Form(""), key: str = Form("")):
+    if not _admin_key(request) and key not in settings.backend_keys:
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    show = key or request.query_params.get("key", "")
+    command = command.strip()[:200]
+    if not command:
+        return _redirect_back(show)
+    sent, routes = 0, set()
+    for sid in list(stats.peers):
+        peer = stats.peer_socket(sid)
+        if peer is None:
+            continue
+        try:
+            await peer.send_text(json.dumps(remote_command_frame(str(uuid.uuid4()), command)))
+            sent += 1
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+    stats.event("broadcast '%s' -> %d device(s)" % (command, sent))
+    return _redirect_back(show)
+
+
+@app.post("/admin/model-unload")
+async def admin_model_unload(request: Request, key: str = Form("")):
+    if not _admin_key(request) and key not in settings.backend_keys:
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    show = key or request.query_params.get("key", "")
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            resp = await client.post("http://localhost:11434/api/generate",
+                                     json={"model": settings.local_model, "keep_alive": 0})
+        if resp.status_code == 200:
+            stats.event("model unloaded from RAM (%s)" % settings.local_model)
+        else:
+            stats.event("unload failed: HTTP %d" % resp.status_code)
+    except Exception as e:
+        stats.event("unload failed: %s" % str(e)[:100])
+    return _redirect_back(show)
+
+
+@app.post("/admin/note")
+async def admin_note(request: Request, content: str = Form(""), key: str = Form("")):
+    if not _admin_key(request) and key not in settings.backend_keys:
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    show = key or request.query_params.get("key", "")
+    content = content.strip()[:2000]
+    if content:
+        try:
+            memory_store.save(content, ["dashboard"], 0.6)
+            stats.event("note saved to shared memory")
+        except ValueError:
+            pass
+    return _redirect_back(show)
+
+
+@app.post("/admin/task")
+async def admin_task(request: Request, title: str = Form(""), key: str = Form("")):
+    if not _admin_key(request) and key not in settings.backend_keys:
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    show = key or request.query_params.get("key", "")
+    title = title.strip()[:300]
+    if title:
+        try:
+            task_store.create(title)
+            stats.event("task added: %s" % title[:80])
+        except ValueError:
+            pass
+    return _redirect_back(show)
+
+
 def _device_socket(device: str):
     # Direct session id first (live socket), then stable device id via its
     # known sessions (newest first). Lets the dashboard target a device
