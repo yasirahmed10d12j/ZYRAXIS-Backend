@@ -362,7 +362,8 @@ async def admin(request: Request):
         return JSONResponse({"detail": "unauthorized"}, status_code=401)
     ok, models = await _ollama_status()
     key = request.query_params.get("key", "")
-    hub = {"memories": len(memory_store.items), "tasks": len(task_store.list("active"))}
+    hub = {"memories": len(memory_store.items), "tasks": len(task_store.list("active")),
+           "sys": _system_stats()}
     return HTMLResponse(render_admin(stats, settings, ok, models, key, _connect_info(), hub))
 
 
@@ -484,6 +485,48 @@ async def admin_task(request: Request, title: str = Form(""), key: str = Form(""
             stats.event("task added: %s" % title[:80])
         except ValueError:
             pass
+    return _redirect_back(show)
+
+
+@app.post("/admin/weather")
+async def admin_weather(request: Request, lat: str = Form(""), lon: str = Form(""), key: str = Form("")):
+    if not _admin_key(request) and key not in settings.backend_keys:
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    show = key or request.query_params.get("key", "")
+    try:
+        la, lo = float(lat), float(lon)
+        if not (-90 <= la <= 90 and -180 <= lo <= 180):
+            raise ValueError("range")
+        data = await _fetch_weather(la, lo)
+        data["ok"] = True
+        stats.last_weather = data
+        stats.event("weather checked %.2f,%.2f" % (la, lo))
+    except ValueError:
+        stats.last_weather = {"ok": False, "error": "bad coordinates"}
+    except Exception as e:
+        stats.last_weather = {"ok": False, "error": str(e)[:100]}
+    return _redirect_back(show)
+
+
+@app.post("/admin/vision")
+async def admin_vision(request: Request, image: str = Form(""), question: str = Form(""), key: str = Form("")):
+    if not _admin_key(request) and key not in settings.backend_keys:
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    show = key or request.query_params.get("key", "")
+    if not image.strip():
+        stats.last_vision = "No image received."
+    elif len(image) > 11 * 1048576:
+        stats.last_vision = "Image too large (8 MiB cap)."
+    else:
+        try:
+            stats.last_vision = await _describe_image(
+                image, (question or "Describe this image briefly.")[:500],
+                settings.vision_model, settings.ollama_host)
+            stats.event("vision described an image")
+        except LookupError as e:
+            stats.last_vision = str(e)
+        except Exception:
+            stats.last_vision = "Vision model failure."
     return _redirect_back(show)
 
 
@@ -707,3 +750,104 @@ async def tasks_snooze(api_version: str, task_id: str, request: Request):
     if item is None:
         return JSONResponse({"detail": "not found"}, status_code=404)
     return item
+
+
+# MARK: - Senses (vision, weather, system, voice). All optional layers;
+# every failure is an honest 5xx, never a fabricated answer.
+from .senses import describe_image as _describe_image
+from .senses import describe_wmo as _describe_wmo  # noqa: F401 (dashboard/tests)
+from .senses import fetch_weather as _fetch_weather
+from .senses import system_stats as _system_stats
+from .senses import transcribe_pcm16 as _transcribe_pcm16
+
+
+@app.post("/api/{api_version}/vision")
+async def vision_describe(api_version: str, request: Request):
+    denied = _require_key(request)
+    if denied is not None:
+        return denied
+    try:
+        raw = await request.body()
+    except Exception:
+        return JSONResponse({"detail": "unreadable body"}, status_code=400)
+    if len(raw) > 8 * 1048576:
+        return JSONResponse({"detail": "image too large (8 MiB cap)"}, status_code=413)
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return JSONResponse({"detail": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict) or not body.get("image"):
+        return JSONResponse({"detail": "missing 'image' (base64)"}, status_code=400)
+    question = str(body.get("question") or "Describe this image briefly.")[:500]
+    try:
+        text = await _describe_image(str(body["image"]), question,
+                                     settings.vision_model, settings.ollama_host)
+    except LookupError as e:
+        return JSONResponse({"detail": str(e)}, status_code=503)
+    except (RuntimeError, Exception):
+        return JSONResponse({"detail": "vision model failure"}, status_code=502)
+    return {"text": text, "model": settings.vision_model}
+
+
+@app.get("/api/{api_version}/weather")
+async def weather_now(api_version: str, request: Request):
+    denied = _require_key(request)
+    if denied is not None:
+        return denied
+    try:
+        lat = float(request.query_params.get("lat", ""))
+        lon = float(request.query_params.get("lon", ""))
+    except (TypeError, ValueError):
+        return JSONResponse({"detail": "lat/lon required (decimal degrees)"}, status_code=400)
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return JSONResponse({"detail": "lat/lon out of range"}, status_code=400)
+    try:
+        return await _fetch_weather(lat, lon)
+    except Exception:
+        return JSONResponse({"detail": "weather provider failure"}, status_code=502)
+
+
+@app.get("/api/{api_version}/system")
+async def system_health(api_version: str, request: Request):
+    denied = _require_key(request)
+    if denied is not None:
+        return denied
+    return _system_stats()
+
+
+@app.post("/api/{api_version}/transcribe")
+async def transcribe(api_version: str, request: Request):
+    denied = _require_key(request)
+    if denied is not None:
+        return denied
+    try:
+        raw = await request.body()
+    except Exception:
+        return JSONResponse({"detail": "unreadable body"}, status_code=400)
+    if len(raw) > 5 * 1048576:
+        return JSONResponse({"detail": "audio too large (5 MiB cap)"}, status_code=413)
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return JSONResponse({"detail": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict) or not body.get("audio"):
+        return JSONResponse({"detail": "missing 'audio' (base64 PCM16 mono)"}, status_code=400)
+    import base64
+
+    try:
+        pcm = base64.b64decode(body["audio"], validate=True)
+    except Exception:
+        return JSONResponse({"detail": "audio is not valid base64"}, status_code=400)
+    try:
+        rate = int(body.get("sample_rate", 16000))
+    except (TypeError, ValueError):
+        return JSONResponse({"detail": "bad sample_rate"}, status_code=400)
+    if rate not in (8000, 16000, 44100, 48000):
+        return JSONResponse({"detail": "sample_rate must be 8000/16000/44100/48000"}, status_code=400)
+    try:
+        text = await _transcribe_pcm16(pcm, rate, settings.vosk_model_dir)
+    except FileNotFoundError as e:
+        return JSONResponse({"detail": str(e)}, status_code=503)
+    except (ValueError, Exception):
+        return JSONResponse({"detail": "transcription failure"}, status_code=502)
+    return {"text": text}

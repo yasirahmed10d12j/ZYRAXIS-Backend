@@ -4,3 +4,5 @@ uvicorn[standard]
 httpx
 pytest
 python-multipart
+psutil
+vosk

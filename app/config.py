@@ -14,6 +14,9 @@ class Settings:
     groq_model: str = "llama-3.1-8b-instant"
     local_model: str = "qwen2.5:3b"
     local_base: str = "http://localhost:11434/v1/chat/completions"
+    ollama_host: str = "http://localhost:11434"
+    vision_model: str = "moondream"
+    vosk_model_dir: str = r"A:\ZYRAXIS-Server\models\vosk-model-small-en-us-0.15"
     provider_order: tuple = ("gemini", "groq")
     api_version: str = "v1"
     system_prompt: str = (
@@ -49,6 +52,11 @@ def get_settings() -> Settings:
         local_model=os.environ.get("LOCAL_MODEL", "qwen2.5:3b").strip() or "qwen2.5:3b",
         local_base=os.environ.get("LOCAL_BASE", "http://localhost:11434/v1/chat/completions").strip()
         or "http://localhost:11434/v1/chat/completions",
+        ollama_host=os.environ.get("OLLAMA_HOST", "http://localhost:11434").strip()
+        or "http://localhost:11434",
+        vision_model=os.environ.get("VISION_MODEL", "moondream").strip() or "moondream",
+        vosk_model_dir=os.environ.get("VOSK_MODEL_DIR", r"A:\ZYRAXIS-Server\models\vosk-model-small-en-us-0.15").strip()
+        or r"A:\ZYRAXIS-Server\models\vosk-model-small-en-us-0.15",
         provider_order=order,
         api_version=os.environ.get("API_VERSION", "v1").strip() or "v1",
         system_prompt=os.environ.get("SYSTEM_PROMPT", "").strip()

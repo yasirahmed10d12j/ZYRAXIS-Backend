@@ -28,6 +28,8 @@ class AdminStats:
     peers: dict = field(default_factory=dict)
     pending: dict = field(default_factory=dict)
     ping_sent: dict = field(default_factory=dict)
+    last_weather: dict = field(default_factory=dict)
+    last_vision: str = ""
 
     def hit_ip(self, ip: str) -> None:
         self.per_ip[ip] = self.per_ip.get(ip, 0) + 1

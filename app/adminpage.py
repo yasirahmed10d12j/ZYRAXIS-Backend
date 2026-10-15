@@ -48,6 +48,40 @@ def render(stats, settings, ollama_ok: bool, ollama_models: list, admin_key: str
     order = ",".join(settings.provider_order)
     c = connect or {}
     connect_html = connect_card(c.get("base", "—"), c.get("ws", "—"), c.get("key", "—"))
+    h = hub or {}
+    sys = h.get("sys") or {}
+    ram = sys.get("ram") or {}
+    disks = sys.get("disks") or {}
+    da = disks.get("A:\\", {})
+    batt = sys.get("battery")
+    sys_html = """<div class="cards">
+<div class="card"><b>%s%%</b><span>CPU</span></div>
+<div class="card"><b>%s%%</b><span>RAM (%s/%s GB)</span></div>
+<div class="card"><b>%s%%</b><span>Drive A free %s GB</span></div>
+<div class="card"><b>%s</b><span>Battery</span></div>
+<div class="card"><b>%s h</b><span>Uptime</span></div>
+</div>""" % (
+        escape(str(sys.get("cpu_pct", "?"))),
+        escape(str(ram.get("pct", "?"))),
+        escape(str(ram.get("used_gb", "?"))), escape(str(ram.get("total_gb", "?"))),
+        escape(str(da.get("pct", "?"))), escape(str(da.get("free_gb", "?"))),
+        escape(("%s%% %s" % (batt["pct"], "⚡" if batt["plugged"] else "🔋")) if batt else "—"),
+        escape(str(sys.get("uptime_h", "?"))),
+    )
+    w = stats.last_weather if isinstance(stats.last_weather, dict) else {}
+    if w.get("ok"):
+        weather_html = """<div class="card" style="min-width:280px"><b style="font-size:15px">%s°C · %s</b><span>H %s%% · wind %s kph · today %s/%s°C · rain %s%%</span></div>""" % (
+            escape(str(w.get("temp_c", "?"))), escape(str(w.get("desc", "?"))),
+            escape(str(w.get("humidity", "?"))), escape(str(w.get("wind_kph", "?"))),
+            escape(str((w.get("today") or {}).get("min_c", "?"))),
+            escape(str((w.get("today") or {}).get("max_c", "?"))),
+            escape(str((w.get("today") or {}).get("precip_prob", "?"))))
+    elif w.get("error"):
+        weather_html = """<div class="warn">Weather failed: %s</div>""" % escape(str(w["error"])[:120])
+    else:
+        weather_html = """<div class="note">No lookup yet — enter coordinates below.</div>"""
+    vision_html = ("""<div class="card" style="min-width:280px"><b style="font-size:14px">%s</b><span>last vision result</span></div>"""
+                   % escape(stats.last_vision[:500])) if stats.last_vision else ""
     return """<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta http-equiv="refresh" content="30">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -158,6 +192,40 @@ button.copy{padding:5px 12px;font-size:12px;margin:0 0 0 8px}
 <div class="note">Unload the local model from RAM (frees ~2GB on this 8GB laptop). The next chat reloads it automatically (slow first reply).</div>
 <div><button type="submit">Unload model</button></div>
 </form>
+<h2>System health (this laptop)</h2>
+%s
+<h2>Weather (Open-Meteo, keyless)</h2>
+%s
+<form method="post" action="/admin/weather">
+<input type="hidden" name="key" value="%s">
+<label>Coordinates (decimal degrees — e.g. Delhi 28.61, 77.20)</label>
+<input name="lat" placeholder="28.61" style="max-width:200px"> <input name="lon" placeholder="77.20" style="max-width:200px">
+<div><button type="submit">Check weather</button></div>
+</form>
+<h2>Vision (local moondream)</h2>
+%s
+<form method="post" action="/admin/vision" id="vi-form" onsubmit="return packVision()">
+<input type="hidden" name="key" value="%s">
+<input type="hidden" name="image" id="vi-b64" value="">
+<input type="hidden" name="question" id="vi-q" value="">
+<label>Photo</label>
+<input type="file" id="vi-file" accept="image/*">
+<label>Question</label>
+<input id="vi-qq" placeholder="What is in this picture?" maxlength="500">
+<div><button type="submit">Describe (1–3 min on CPU)</button></div>
+</form>
+<script>
+function packVision(){
+  var f=document.getElementById('vi-file').files[0];
+  if(!f){alert('Choose a photo first.');return false;}
+  if(f.size>8*1024*1024){alert('Photo must be under 8 MB.');return false;}
+  var r=new FileReader();
+  r.onload=function(){document.getElementById('vi-b64').value=r.result.split(',')[1]||'';
+    document.getElementById('vi-q').value=document.getElementById('vi-qq').value;
+    document.getElementById('vi-form').submit();};
+  r.readAsDataURL(f);return false;
+}
+</script>
 <h2>Requests per IP</h2>
 <table><tr><th>ip</th><th>hits</th></tr>%s</table>
 <h2>Recent events</h2>
@@ -190,6 +258,11 @@ function copyVal(id){var el=document.getElementById(id);var t=el?el.textContent:
         escape(order),
         settings.max_output_tokens,
         settings.temperature,
+        escape(admin_key),
+        sys_html,
+        weather_html,
+        escape(admin_key),
+        vision_html,
         escape(admin_key),
         ip_rows,
         event_rows,

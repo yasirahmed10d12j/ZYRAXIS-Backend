@@ -130,6 +130,23 @@ One hub for every client (iOS first, Android/Desktop next — same contract):
 - Covered by `tests/test_sync.py` (auth, CRUD, filters, persistence
   round-trip, claim + list, live `remote_command` push to a device id).
 
+### 3d. Senses (vision, weather, system health, server voice)
+
+- Vision: `POST /api/{v}/vision` `{image (base64), question?}` → local
+  vision model (`VISION_MODEL`, default `moondream` — pull it first:
+  `ollama pull moondream`, ~1.7 GB). Missing model → honest 503, never a
+  guessed description. Powers the iOS camera feature.
+- Weather: `GET /api/{v}/weather?lat=&lon=` → current + today from
+  Open-Meteo (keyless, free). Honest 502 when the provider is down.
+- System: `GET /api/{v}/system` → CPU/RAM/disks/battery/uptime of this
+  laptop (psutil), also shown on the dashboard.
+- Voice: `POST /api/{v}/transcribe` `{audio (base64 PCM16 mono),
+  sample_rate?}` → text via local Vosk model (`VOSK_MODEL_DIR`).
+  Missing model → honest 503. Clients must send 16-bit mono PCM
+  (8000/16000/44100/48000 Hz, 5 MiB cap).
+- Covered by `tests/test_senses.py` (mapping, validation, auth, missing
+  model paths, plus a REAL silence-through-Vosk health check).
+
 Local iOS pointing (same Wi-Fi/hotspot; app needs `http://` ATS exception or
 `https` via a tunnel — iOS change only if you approve it):
 base URL `http://<laptop-ip>:8000`, WS `ws://<laptop-ip>:8000/live`.
