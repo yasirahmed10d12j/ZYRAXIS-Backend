@@ -97,7 +97,6 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
    `PROVIDER_ORDER=gemini,groq`; laptop runs `local,gemini,groq`.
 
 ### 3b. Admin dashboard (devices + control, same process)
-
 Open `http://<laptop-ip>:8000/admin?key=<one BACKEND_API_KEYS value>` (LAN only):
 status cards (uptime, WS connections, REST chats, LLM ok/fail, Ollama UP/DOWN),
 devices table (session, IP, client model), runtime config form (provider order,
@@ -108,6 +107,28 @@ queue until next `session_start`), device ping (pong latency in events), and
 clear. No key is ever shown or editable there. New endpoints are covered by
 `tests/test_admin.py` (auth gate, device tracking, runtime config, mirror,
 queue, clear).
+
+### 3c. Ecosystem sync API (shared memory + tasks + device identity)
+
+One hub for every client (iOS first, Android/Desktop next — same contract):
+
+- Identity: `session_start` accepts optional `deviceId` (stable per device)
+  + `deviceName` ("Yasir's iPhone"). Without them the server falls back to
+  the per-turn session id (old behavior). `GET /api/{v}/devices` (Bearer)
+  lists claimed devices with online status.
+- Memory: `GET /api/{v}/memory?query=&limit=`, `POST /api/{v}/memory`
+  `{content, tags?, importance?}`, `DELETE /api/{v}/memory/{id}`.
+  Substring search + importance ordering mirror the iOS local service.
+- Tasks: `GET /api/{v}/tasks?filter=active|all|completed|cancelled`,
+  `POST /api/{v}/tasks` `{title, notes?, dueDate?, priority?}`,
+  `POST /api/{v}/tasks/{id}/complete|cancel`,
+  `POST /api/{v}/tasks/{id}/snooze` `{until}`.
+- Storage: JSON files (`MEMORY_FILE`/`TASKS_FILE`, default
+  `A:\ZYRAXIS-Server\hub\`), atomic replace, survive restarts. Honest
+  limit: notifications still fire per-device only (OS design); the hub
+  holds the shared list.
+- Covered by `tests/test_sync.py` (auth, CRUD, filters, persistence
+  round-trip, claim + list, live `remote_command` push to a device id).
 
 Local iOS pointing (same Wi-Fi/hotspot; app needs `http://` ATS exception or
 `https` via a tunnel — iOS change only if you approve it):

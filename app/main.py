@@ -28,6 +28,7 @@ from .admin_stats import AdminStats, StatsLogHandler
 from .adminpage import render as render_admin
 from .auth import AuthError, check_bearer, check_ws_key
 from .config import get_settings
+from .syncstore import MemoryStore, TaskStore
 from .protocol import (
     PROTOCOL_VERSION,
     assistant_complete,
@@ -45,6 +46,13 @@ settings = get_settings()
 limiter = RateLimiter()
 stats = AdminStats()
 logging.getLogger("zyraxis").addHandler(StatsLogHandler(stats))
+
+# Shared ecosystem stores (JSON on disk so a restart keeps everything).
+# Paths are env-overridable for tests; defaults live on Drive A:.
+import os as _os
+
+memory_store = MemoryStore(_os.environ.get("MEMORY_FILE", r"A:\ZYRAXIS-Server\hub\memory.json"))
+task_store = TaskStore(_os.environ.get("TASKS_FILE", r"A:\ZYRAXIS-Server\hub\tasks.json"))
 
 # Largest accepted REST body (1 MiB). Starlette reads bodies unbounded by
 # default; on a 512 MB free instance an unbounded read is a trivial DoS.
@@ -222,14 +230,31 @@ async def live(websocket: WebSocket):
             if mtype == "session_start":
                 # Client self-emits .connected; no ack frame defined. But the
                 # handshake carries device identity — record it for /admin.
+                # Newer clients send stable deviceId/deviceName (one phone =
+                # one device across turns); older ones fall back to the
+                # per-turn session id (previous behavior, unchanged).
                 sid = payload.get("sessionId") or rid
-                stats.device_seen(sid, ip, payload)
-                stats.peers[sid] = websocket
-                stats.event("device %s %s" % (ip, payload.get("clientModel") or "?"))
-                queued = stats.pop_cmd(sid)
+                did = str(payload.get("deviceId") or sid)[:64]
+                name = str(payload.get("deviceName") or payload.get("clientModel") or "?")[:40]
+                prev = stats.devices.get(did, {})
+                sessions = list(prev.get("sessions", []))
+                if sid not in sessions:
+                    sessions.append(sid)
+                    sessions = sessions[-5:]
+                stats.devices[did] = {
+                    "ip": ip,
+                    "name": name,
+                    "model": str(payload.get("clientModel") or "?")[:40],
+                    "app": str(payload.get("appVersion") or "?")[:20],
+                    "last": time.strftime("%H:%M:%S", time.localtime()),
+                    "sessions": sessions,
+                }
+                stats.peers[sid] = (websocket, did)
+                stats.event("device %s %s" % (ip, name))
+                queued = stats.pop_cmd(did)
                 if queued is not None:
                     await _send(websocket, remote_command_frame(str(uuid.uuid4()), queued))
-                    stats.event("flushed queued cmd to %s" % sid)
+                    stats.event("flushed queued cmd to %s" % did)
                 continue  # client self-emits .connected; no ack frame defined
             if mtype == "user_message":
                 if gen_task is not None and not gen_task.done():
@@ -266,7 +291,7 @@ async def live(websocket: WebSocket):
             gen_task.cancel()
         limiter.release_ws(ip)
         stats.ws_current = max(0, stats.ws_current - 1)
-        dead = [sid for sid, peer in stats.peers.items() if peer is websocket]
+        dead = [sid for sid in list(stats.peers) if stats.peer_socket(sid) is websocket]
         for sid in dead:
             del stats.peers[sid]
         stats.event("ws close %s" % ip)
@@ -337,7 +362,8 @@ async def admin(request: Request):
         return JSONResponse({"detail": "unauthorized"}, status_code=401)
     ok, models = await _ollama_status()
     key = request.query_params.get("key", "")
-    return HTMLResponse(render_admin(stats, settings, ok, models, key, _connect_info()))
+    hub = {"memories": len(memory_store.items), "tasks": len(task_store.list("active"))}
+    return HTMLResponse(render_admin(stats, settings, ok, models, key, _connect_info(), hub))
 
 
 @app.post("/admin/config")
@@ -378,6 +404,21 @@ def _redirect_back(key: str):
     return RedirectResponse("/admin?key=%s" % key if key else "/admin", status_code=303)
 
 
+def _device_socket(device: str):
+    # Direct session id first (live socket), then stable device id via its
+    # known sessions (newest first). Lets the dashboard target a device
+    # across turns instead of a single expiring session.
+    sock = stats.peer_socket(device)
+    if sock is not None:
+        return sock
+    info = stats.devices.get(device) or {}
+    for sid in list(info.get("sessions", []))[::-1]:
+        sock = stats.peer_socket(sid)
+        if sock is not None:
+            return sock
+    return None
+
+
 @app.post("/admin/cmd")
 async def admin_cmd(request: Request, device: str = Form(""), command: str = Form(""), key: str = Form("")):
     if not _admin_key(request) and key not in settings.backend_keys:
@@ -386,7 +427,7 @@ async def admin_cmd(request: Request, device: str = Form(""), command: str = For
     command = command.strip()[:200]
     if not device or not command:
         return _redirect_back(show)
-    peer = stats.peers.get(device)
+    peer = _device_socket(device)
     if peer is not None:
         try:
             await peer.send_text(json.dumps(remote_command_frame(str(uuid.uuid4()), command)))
@@ -405,7 +446,7 @@ async def admin_ping(request: Request, device: str = Form(""), key: str = Form("
     if not _admin_key(request) and key not in settings.backend_keys:
         return JSONResponse({"detail": "unauthorized"}, status_code=401)
     show = key or request.query_params.get("key", "")
-    peer = stats.peers.get(device)
+    peer = _device_socket(device)
     if peer is not None:
         rid = str(uuid.uuid4())
         stats.ping_sent[rid] = time.time()
@@ -430,3 +471,156 @@ async def admin_clear(request: Request, key: str = Form("")):
     stats.events.clear()
     stats.event("dashboard cleared by admin")
     return _redirect_back(show)
+
+
+def _require_key(request: Request):
+    try:
+        check_bearer(request.headers.get("authorization"), settings.backend_keys)
+        return None
+    except AuthError as e:
+        return JSONResponse({"detail": str(e)}, status_code=401)
+
+
+# MARK: - Ecosystem sync API (shared memory + tasks + devices).
+#
+# Every client uses the same Bearer key as chat. Bodies are small JSON;
+# responses are plain JSON (no envelopes here — envelopes are WS-only).
+
+
+@app.get("/api/{api_version}/devices")
+async def list_devices(api_version: str, request: Request):
+    denied = _require_key(request)
+    if denied is not None:
+        return denied
+    out = []
+    for did, d in stats.devices.items():
+        out.append({
+            "id": did,
+            "name": d.get("name", "?"),
+            "ip": d.get("ip", "?"),
+            "model": d.get("model", "?"),
+            "app": d.get("app", "?"),
+            "online": any(s in stats.peers for s in d.get("sessions", [])),
+            "sessions": len(d.get("sessions", [])),
+            "last": d.get("last", ""),
+        })
+    out.sort(key=lambda d: d["last"], reverse=True)
+    return {"devices": out}
+
+
+@app.get("/api/{api_version}/memory")
+async def memory_search(api_version: str, request: Request):
+    denied = _require_key(request)
+    if denied is not None:
+        return denied
+    try:
+        limit = max(1, min(100, int(request.query_params.get("limit", "20"))))
+    except ValueError:
+        limit = 20
+    return {"memories": memory_store.search(request.query_params.get("query", ""), limit)}
+
+
+@app.post("/api/{api_version}/memory")
+async def memory_save(api_version: str, request: Request):
+    denied = _require_key(request)
+    if denied is not None:
+        return denied
+    try:
+        body = json.loads((await request.body()).decode("utf-8"))
+    except ValueError:
+        return JSONResponse({"detail": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"detail": "invalid JSON body"}, status_code=400)
+    try:
+        item = memory_store.save(
+            body.get("content", ""),
+            body.get("tags") or [],
+            body.get("importance", 0.5),
+        )
+    except (ValueError, TypeError):
+        return JSONResponse({"detail": "missing 'content'"}, status_code=400)
+    return item
+
+
+@app.delete("/api/{api_version}/memory/{item_id}")
+async def memory_forget(api_version: str, item_id: str, request: Request):
+    denied = _require_key(request)
+    if denied is not None:
+        return denied
+    if not memory_store.forget(item_id):
+        return JSONResponse({"detail": "not found"}, status_code=404)
+    return {"forgotten": item_id}
+
+
+@app.get("/api/{api_version}/tasks")
+async def tasks_list(api_version: str, request: Request):
+    denied = _require_key(request)
+    if denied is not None:
+        return denied
+    filt = (request.query_params.get("filter", "active") or "active").lower()
+    if filt not in ("active", "all", "completed", "cancelled"):
+        filt = "active"
+    return {"tasks": task_store.list(filt)}
+
+
+@app.post("/api/{api_version}/tasks")
+async def tasks_create(api_version: str, request: Request):
+    denied = _require_key(request)
+    if denied is not None:
+        return denied
+    try:
+        body = json.loads((await request.body()).decode("utf-8"))
+    except ValueError:
+        return JSONResponse({"detail": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"detail": "invalid JSON body"}, status_code=400)
+    try:
+        item = task_store.create(
+            body.get("title", ""),
+            body.get("notes"),
+            body.get("dueDate"),
+            body.get("priority", "medium"),
+        )
+    except (ValueError, TypeError):
+        return JSONResponse({"detail": "missing 'title'"}, status_code=400)
+    return item
+
+
+@app.post("/api/{api_version}/tasks/{task_id}/complete")
+async def tasks_complete(api_version: str, task_id: str, request: Request):
+    denied = _require_key(request)
+    if denied is not None:
+        return denied
+    item = task_store.complete(task_id)
+    if item is None:
+        return JSONResponse({"detail": "not found"}, status_code=404)
+    return item
+
+
+@app.post("/api/{api_version}/tasks/{task_id}/cancel")
+async def tasks_cancel(api_version: str, task_id: str, request: Request):
+    denied = _require_key(request)
+    if denied is not None:
+        return denied
+    item = task_store.cancel(task_id)
+    if item is None:
+        return JSONResponse({"detail": "not found"}, status_code=404)
+    return item
+
+
+@app.post("/api/{api_version}/tasks/{task_id}/snooze")
+async def tasks_snooze(api_version: str, task_id: str, request: Request):
+    denied = _require_key(request)
+    if denied is not None:
+        return denied
+    try:
+        body = json.loads((await request.body()).decode("utf-8"))
+    except ValueError:
+        return JSONResponse({"detail": "invalid JSON body"}, status_code=400)
+    until = body.get("until") if isinstance(body, dict) else None
+    if not until:
+        return JSONResponse({"detail": "missing 'until'"}, status_code=400)
+    item = task_store.snooze(task_id, str(until))
+    if item is None:
+        return JSONResponse({"detail": "not found"}, status_code=404)
+    return item

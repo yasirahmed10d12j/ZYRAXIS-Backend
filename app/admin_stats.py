@@ -53,9 +53,18 @@ class AdminStats:
 
     def peer_name(self, ws) -> str | None:
         for sid, peer in self.peers.items():
-            if peer is ws:
+            sock = peer[0] if isinstance(peer, tuple) else peer
+            if sock is ws:
+                if isinstance(peer, tuple):
+                    return peer[1]
                 return sid
         return None
+
+    def peer_socket(self, sid: str):
+        peer = self.peers.get(sid)
+        if isinstance(peer, tuple):
+            return peer[0]
+        return peer
 
     def record_turn(self, device: str, text: str, reply: str) -> None:
         self.transcript.appendleft({

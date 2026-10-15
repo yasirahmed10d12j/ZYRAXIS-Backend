@@ -8,26 +8,26 @@ from __future__ import annotations
 from html import escape
 
 
-def render(stats, settings, ollama_ok: bool, ollama_models: list, admin_key: str = "", connect: dict | None = None) -> str:
+def render(stats, settings, ollama_ok: bool, ollama_models: list, admin_key: str = "", connect: dict | None = None, hub: dict | None = None) -> str:
     # Devices grouped by (ip, client): one iPhone opens a fresh session per
     # chat turn (sessionId == requestId by design), so raw rows would spam
     # one line per message. Group shows: client, ip, session count, last seen.
     groups: dict = {}
     for sid, d in stats.devices.items():
-        gkey = (d["ip"], d["model"])
-        g = groups.setdefault(gkey, {"n": 0, "last": "", "online": False, "sid": sid})
+        gkey = (d.get("ip", "?"), d.get("model", "?"))
+        g = groups.setdefault(gkey, {"n": 0, "last": "", "online": False, "name": d.get("name", "?")})
         g["n"] += 1
-        if d["last"] >= g["last"]:
-            g["last"] = d["last"]
-            g["sid"] = sid
+        if d.get("last", "") >= g["last"]:
+            g["last"] = d.get("last", "")
+            g["name"] = d.get("name", "?")
         if sid in stats.peers:
             g["online"] = True
     dev_rows = "".join(
-        "<tr><td>%s</td><td>%s</td><td>%d session%s%s</td><td>%s</td></tr>"
-        % (escape(model), escape(ip), g["n"], "" if g["n"] == 1 else "s",
+        "<tr><td>%s</td><td>%s</td><td>%s</td><td>%d session%s%s</td><td>%s</td></tr>"
+        % (escape(g["name"]), escape(model), escape(ip), g["n"], "" if g["n"] == 1 else "s",
            " · ONLINE" if g["online"] else "", escape(g["last"]))
         for (ip, model), g in groups.items()
-    ) or '<tr><td colspan="4">no devices yet — open the app and send a message</td></tr>'
+    ) or '<tr><td colspan="5">no devices yet — open the app and send a message</td></tr>'
 
     ip_rows = "".join(
         "<tr><td>%s</td><td>%d</td></tr>" % (escape(ip), n)
@@ -45,11 +45,16 @@ def render(stats, settings, ollama_ok: bool, ollama_models: list, admin_key: str
         for t in stats.transcript
     ) or '<tr><td colspan="4">no chats yet — send a message from the app</td></tr>'
 
+    def _device_online(did, info):
+        if did in stats.peers:
+            return True
+        return any(s in stats.peers for s in info.get("sessions", []))
+
     dev_opts = "".join(
-        '<option value="%s">%s (%s)%s</option>'
-        % (escape(sid), escape(d["model"]), escape(d["ip"]),
-           " · ONLINE" if sid in stats.peers else "")
-        for sid, d in stats.devices.items()
+        '<option value="%s">%s (%s · %s)%s</option>'
+        % (escape(did), escape(info.get("name", "?")), escape(info.get("model", "?")), escape(info.get("ip", "?")),
+           " · ONLINE" if _device_online(did, info) else "")
+        for did, info in stats.devices.items()
     ) or '<option value="">no devices yet</option>'
 
     pend_rows = "".join(
@@ -106,9 +111,11 @@ button.ghost{background:#1e293b;margin-left:8px}
 <div class="card"><b>%d / %d</b><span>LLM ok / fail</span></div>
 <div class="card"><b class="%s">%s</b><span>Ollama (%s)</span></div>
 <div class="card"><b>%d</b><span>devices seen</span></div>
+<div class="card"><b>%d</b><span>shared memories</span></div>
+<div class="card"><b>%d</b><span>active tasks</span></div>
 </div>
 <h2>Devices</h2>
-<table><tr><th>device</th><th>ip</th><th>sessions</th><th>last seen</th></tr>%s</table>
+<table><tr><th>name</th><th>device</th><th>ip</th><th>sessions</th><th>last seen</th></tr>%s</table>
 <h2>Remote command → device</h2>
 <form method="post" action="/admin/cmd">
 <input type="hidden" name="key" value="%s">
@@ -154,6 +161,8 @@ button.ghost{background:#1e293b;margin-left:8px}
         "UP" if ollama_ok else "DOWN",
         escape(models),
         len(stats.devices),
+        (hub or {}).get("memories", 0),
+        (hub or {}).get("tasks", 0),
         dev_rows,
         escape(admin_key),
         dev_opts,
