@@ -599,6 +599,59 @@ async def admin_clear(request: Request, key: str = Form("")):
     return _redirect_back(show)
 
 
+def _json_key(request: Request, body_key: str = "") -> bool:
+    # Desktop client: JSON body key ya ?key=/Bearer — iOS contract untouched.
+    if body_key and settings.backend_keys and body_key in settings.backend_keys:
+        return True
+    return _admin_key(request)
+
+
+@app.get("/admin/api/devices")
+async def admin_api_devices(request: Request, key: str = ""):
+    """Connected phones ki list (desktop monitor ke liye)."""
+    if not _json_key(request, key):
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    out = []
+    for did, info in stats.devices.items():
+        online = any(stats.peer_socket(sid) is not None for sid in info.get("sessions", []))
+        out.append({
+            "id": did,
+            "name": info.get("name", "?"),
+            "model": info.get("model", "?"),
+            "last": info.get("last", "?"),
+            "online": online,
+        })
+    return {"devices": out}
+
+
+@app.post("/admin/api/cmd")
+async def admin_api_cmd(request: Request):
+    """Phone ko command bhejo (online ho to turant, nahi to judte hi)."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    if not _json_key(request, str(body.get("key") or "")):
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    device = str(body.get("device") or "").strip()[:64]
+    command = str(body.get("command") or "").strip()[:200]
+    if not device or not command:
+        return JSONResponse({"detail": "device and command required"}, status_code=400)
+    peer = _device_socket(device)
+    if peer is not None:
+        try:
+            await peer.send_text(json.dumps(remote_command_frame(str(uuid.uuid4()), command)))
+            stats.event("api cmd -> %s: %s" % (device, command))
+            return {"ok": True, "delivered": True}
+        except Exception:
+            pass
+    stats.queue_cmd(device, command)
+    stats.event("api cmd queued for %s" % device)
+    return {"ok": True, "delivered": False, "queued": True}
+
+
 def _require_key(request: Request):
     try:
         check_bearer(request.headers.get("authorization"), settings.backend_keys)
@@ -750,6 +803,87 @@ async def tasks_snooze(api_version: str, task_id: str, request: Request):
     if item is None:
         return JSONResponse({"detail": "not found"}, status_code=404)
     return item
+
+
+# MARK: - Wake-on-LAN (WoL) — power on office desktop from iOS/Android.
+#
+# Phone sends magic packet to the configured desktop MAC so the laptop
+# can be turned on remotely. Requires WoL enabled in BIOS + Windows adapter,
+# laptop on AC power, and same LAN (or VPN/relay from outside).
+
+import socket as _socket
+
+_wol_config = {"mac": None, "broadcastAddress": "255.255.255.255", "port": 9}
+
+
+def _parse_mac(mac: str) -> bytes:
+    hex_str = mac.replace(":", "").replace("-", "").replace(".", "")
+    if len(hex_str) != 12 or any(c not in "0123456789abcdefABCDEF" for c in hex_str):
+        raise ValueError("invalid MAC address")
+    return bytes.fromhex(hex_str)
+
+
+def _build_magic_packet(mac_bytes: bytes) -> bytes:
+    return b"\xff" * 6 + mac_bytes * 16
+
+
+def _send_magic_packet(mac: str, broadcast: str = "255.255.255.255", port: int = 9) -> None:
+    mac_bytes = _parse_mac(mac)
+    packet = _build_magic_packet(mac_bytes)
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_BROADCAST, 1)
+        sock.sendto(packet, (broadcast, port))
+    finally:
+        sock.close()
+
+
+@app.get("/api/{api_version}/wol/status")
+async def wol_status(api_version: str, request: Request):
+    denied = _require_key(request)
+    if denied is not None:
+        return denied
+    return {"configured": bool(_wol_config["mac"]), "mac": _wol_config["mac"]}
+
+
+@app.post("/api/{api_version}/wol/config")
+async def wol_config(api_version: str, request: Request):
+    denied = _require_key(request)
+    if denied is not None:
+        return denied
+    try:
+        body = json.loads((await request.body()).decode("utf-8"))
+    except ValueError:
+        return JSONResponse({"detail": "invalid JSON body"}, status_code=400)
+    mac = body.get("mac")
+    if not mac:
+        return JSONResponse({"detail": "missing 'mac'"}, status_code=400)
+    try:
+        _parse_mac(mac)
+    except ValueError:
+        return JSONResponse({"detail": "invalid 'mac'"}, status_code=400)
+    _wol_config["mac"] = mac
+    _wol_config["broadcastAddress"] = body.get("broadcastAddress", "255.255.255.255")
+    _wol_config["port"] = body.get("port", 9)
+    return {"ok": True, "mac": mac}
+
+
+@app.post("/api/{api_version}/wol/wake")
+async def wol_wake(api_version: str, request: Request):
+    denied = _require_key(request)
+    if denied is not None:
+        return denied
+    if not _wol_config["mac"]:
+        return JSONResponse({"detail": "MAC not configured. Use /api/wol/config first."}, status_code=400)
+    try:
+        _send_magic_packet(
+            _wol_config["mac"],
+            _wol_config.get("broadcastAddress", "255.255.255.255"),
+            _wol_config.get("port", 9),
+        )
+        return {"ok": True, "mac": _wol_config["mac"]}
+    except Exception as e:
+        return JSONResponse({"detail": str(e)}, status_code=500)
 
 
 # MARK: - Senses (vision, weather, system, voice). All optional layers;
