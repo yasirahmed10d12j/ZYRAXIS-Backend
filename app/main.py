@@ -805,15 +805,19 @@ async def tasks_snooze(api_version: str, task_id: str, request: Request):
     return item
 
 
-# MARK: - Wake-on-LAN (WoL) — power on office desktop from iOS/Android.
+# MARK: - Wake-on-LAN (WoL) — power on desktops from iOS/Android.
 #
-# Phone sends magic packet to the configured desktop MAC so the laptop
-# can be turned on remotely. Requires WoL enabled in BIOS + Windows adapter,
-# laptop on AC power, and same LAN (or VPN/relay from outside).
+# Phone sends a magic packet to a *named* desktop MAC so the machine can be
+# turned on remotely. Several named targets (Home PC, Office PC, School PC)
+# can be configured side by side. Requires WoL enabled in BIOS + Windows
+# adapter, the machine on AC power, and the hub on the same LAN (or a
+# VPN/relay when waking from outside).
 
 import socket as _socket
 
-_wol_config = {"mac": None, "broadcastAddress": "255.255.255.255", "port": 9}
+# Named WoL targets — name -> {mac, broadcastAddress, port}. In-memory, like
+# the rest of the hub's soft state.
+_wol_profiles: dict = {}
 
 
 def _parse_mac(mac: str) -> bytes:
@@ -838,12 +842,30 @@ def _send_magic_packet(mac: str, broadcast: str = "255.255.255.255", port: int =
         sock.close()
 
 
+def _wol_profile_list() -> list:
+    return [
+        {
+            "name": name,
+            "mac": cfg["mac"],
+            "broadcastAddress": cfg.get("broadcastAddress", "255.255.255.255"),
+            "port": cfg.get("port", 9),
+        }
+        for name, cfg in _wol_profiles.items()
+    ]
+
+
 @app.get("/api/{api_version}/wol/status")
 async def wol_status(api_version: str, request: Request):
     denied = _require_key(request)
     if denied is not None:
         return denied
-    return {"configured": bool(_wol_config["mac"]), "mac": _wol_config["mac"]}
+    first = next(iter(_wol_profiles.values()), None)
+    return {
+        "configured": bool(_wol_profiles),
+        # `mac` kept for older clients that read the single-target shape.
+        "mac": first["mac"] if first else None,
+        "profiles": _wol_profile_list(),
+    }
 
 
 @app.post("/api/{api_version}/wol/config")
@@ -855,6 +877,8 @@ async def wol_config(api_version: str, request: Request):
         body = json.loads((await request.body()).decode("utf-8"))
     except ValueError:
         return JSONResponse({"detail": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"detail": "invalid JSON body"}, status_code=400)
     mac = body.get("mac")
     if not mac:
         return JSONResponse({"detail": "missing 'mac'"}, status_code=400)
@@ -862,10 +886,26 @@ async def wol_config(api_version: str, request: Request):
         _parse_mac(mac)
     except ValueError:
         return JSONResponse({"detail": "invalid 'mac'"}, status_code=400)
-    _wol_config["mac"] = mac
-    _wol_config["broadcastAddress"] = body.get("broadcastAddress", "255.255.255.255")
-    _wol_config["port"] = body.get("port", 9)
-    return {"ok": True, "mac": mac}
+    name = (body.get("name") or "").strip() or "Default"
+    _wol_profiles[name] = {
+        "mac": mac,
+        "broadcastAddress": body.get("broadcastAddress", "255.255.255.255"),
+        "port": body.get("port", 9),
+    }
+    return {"ok": True, "name": name, "mac": mac, "profiles": _wol_profile_list()}
+
+
+@app.delete("/api/{api_version}/wol/config/{profile_name}")
+async def wol_config_delete(api_version: str, profile_name: str, request: Request):
+    denied = _require_key(request)
+    if denied is not None:
+        return denied
+    if profile_name not in _wol_profiles:
+        return JSONResponse(
+            {"detail": f"unknown profile '{profile_name}'"}, status_code=404
+        )
+    del _wol_profiles[profile_name]
+    return {"ok": True, "name": profile_name, "profiles": _wol_profile_list()}
 
 
 @app.post("/api/{api_version}/wol/wake")
@@ -873,15 +913,38 @@ async def wol_wake(api_version: str, request: Request):
     denied = _require_key(request)
     if denied is not None:
         return denied
-    if not _wol_config["mac"]:
-        return JSONResponse({"detail": "MAC not configured. Use /api/wol/config first."}, status_code=400)
+    # Optional body: {"name": "Office PC"}. Empty body wakes the first profile
+    # so older clients keep working.
+    name = None
+    raw = await request.body()
+    if raw:
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            body = None
+        if isinstance(body, dict):
+            name = body.get("name")
+    if name:
+        cfg = _wol_profiles.get(name)
+        if cfg is None:
+            return JSONResponse(
+                {"detail": f"unknown profile '{name}'"}, status_code=404
+            )
+    else:
+        name = next(iter(_wol_profiles), None)
+        if name is None:
+            return JSONResponse(
+                {"detail": "MAC not configured. Use /api/wol/config first."},
+                status_code=400,
+            )
+        cfg = _wol_profiles[name]
     try:
         _send_magic_packet(
-            _wol_config["mac"],
-            _wol_config.get("broadcastAddress", "255.255.255.255"),
-            _wol_config.get("port", 9),
+            cfg["mac"],
+            cfg.get("broadcastAddress", "255.255.255.255"),
+            cfg.get("port", 9),
         )
-        return {"ok": True, "mac": _wol_config["mac"]}
+        return {"ok": True, "name": name, "mac": cfg["mac"]}
     except Exception as e:
         return JSONResponse({"detail": str(e)}, status_code=500)
 
