@@ -26,3 +26,14 @@ def test_ws_message_cap():
     lim = RateLimiter(ws_msg_per_min=1)
     assert lim.check_ws_message("1.1.1.1") is True
     assert lim.check_ws_message("1.1.1.1") is False
+
+
+def test_ws_relay_quota_is_separate():
+    # Remote-desktop video must not inherit the chat cap...
+    lim = RateLimiter(ws_msg_per_min=1, ws_relay_per_min=2)
+    assert lim.check_ws_message("1.1.1.1") is True
+    assert lim.check_ws_message("1.1.1.1") is False  # chat cap hit
+    # ...but still gets a (generous) cap of its own.
+    assert lim.check_ws_relay("1.1.1.1") is True
+    assert lim.check_ws_relay("1.1.1.1") is True
+    assert lim.check_ws_relay("1.1.1.1") is False

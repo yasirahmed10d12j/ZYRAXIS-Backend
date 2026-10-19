@@ -182,6 +182,32 @@ async def _run_turn(websocket: WebSocket, rid: str, text: str, context: dict, ip
     await _send(websocket, assistant_complete(rid, full, []))
 
 
+# MARK: - Remote Desktop relay (phone ⇄ laptop, over the hub)
+#
+# Both sides connect to /live and announce the same `sessionKey`:
+#   - the phone announces the key the desktop issued to it
+#   - the laptop announces the key it issued
+# Screen frames (laptop → phone) and input events (phone → laptop) carry that
+# key; each frame is forwarded to every *other* socket registered under the
+# same key. The hub only routes — it never inspects screen content.
+_rd_peers: dict = {}  # websocket -> sessionKey
+
+
+async def _relay_remote_desktop(src, msg: dict, key: str) -> None:
+    """Forward a remote-desktop frame to the other socket(s) on `key`."""
+    data = json.dumps(msg)
+    dead = []
+    for peer, peer_key in list(_rd_peers.items()):
+        if peer is src or peer_key != key:
+            continue
+        try:
+            await peer.send_text(data)
+        except Exception:
+            dead.append(peer)
+    for peer in dead:
+        _rd_peers.pop(peer, None)
+
+
 @app.websocket("/live")
 async def live(websocket: WebSocket):
     await websocket.accept()
@@ -204,14 +230,24 @@ async def live(websocket: WebSocket):
             except WebSocketDisconnect:
                 break
             stats.ws_messages += 1
-            if not limiter.check_ws_message(ip):
-                continue  # drop flood, keep socket
             try:
                 msg = json.loads(raw)
             except ValueError:
-                continue  # malformed frame: tolerate + ignore
+                msg = None  # malformed frame: tolerated below
             if not isinstance(msg, dict):
-                continue
+                msg = None
+            # Remote desktop frames stream continuously (and pairing must
+            # never fail silently) — they ride their own quota, else the chat
+            # cap (2 msg/s) would throttle the screen to a slideshow.
+            relay = isinstance(msg, dict) and msg.get("type") in (
+                "remote-desktop-announce",
+                "remote-desktop-screen",
+                "remote-desktop-input",
+            )
+            if not (limiter.check_ws_relay(ip) if relay else limiter.check_ws_message(ip)):
+                continue  # drop flood, keep socket
+            if msg is None:
+                continue  # malformed frame: tolerate + ignore
             if msg.get("version") != PROTOCOL_VERSION:
                 rid = msg.get("requestId")
                 if isinstance(rid, str) and rid:
@@ -227,6 +263,22 @@ async def live(websocket: WebSocket):
             payload = msg.get("payload") or {}
             if not isinstance(payload, dict):
                 payload = {}
+            if mtype == "remote-desktop-announce":
+                # Register this socket under its session key so screen/input
+                # frames can be routed to the matching peer. A keyless announce
+                # (laptop before pairing) just unregisters the socket.
+                key = payload.get("sessionKey")
+                if isinstance(key, str) and key:
+                    _rd_peers[websocket] = key
+                    stats.event("remote desktop announce %s" % ip)
+                else:
+                    _rd_peers.pop(websocket, None)
+                continue
+            if mtype in ("remote-desktop-screen", "remote-desktop-input"):
+                key = payload.get("sessionKey")
+                if isinstance(key, str) and key:
+                    await _relay_remote_desktop(websocket, msg, key)
+                continue
             if mtype == "session_start":
                 # Client self-emits .connected; no ack frame defined. But the
                 # handshake carries device identity — record it for /admin.
@@ -294,6 +346,7 @@ async def live(websocket: WebSocket):
         dead = [sid for sid in list(stats.peers) if stats.peer_socket(sid) is websocket]
         for sid in dead:
             del stats.peers[sid]
+        _rd_peers.pop(websocket, None)
         stats.event("ws close %s" % ip)
 
 
