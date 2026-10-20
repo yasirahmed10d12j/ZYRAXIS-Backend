@@ -10,8 +10,8 @@ class Settings:
     backend_keys: frozenset = frozenset()
     gemini_api_key: str = ""
     groq_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash-lite"
-    groq_model: str = "llama-3.1-8b-instant"
+    gemini_model: str = "gemini-flash-lite-latest"
+    groq_model: str = "openai/gpt-oss-120b"
     local_model: str = "qwen2.5:3b"
     local_base: str = "http://localhost:11434/v1/chat/completions"
     ollama_host: str = "http://localhost:11434"
@@ -47,8 +47,8 @@ def get_settings() -> Settings:
         backend_keys=frozenset(_csv("BACKEND_API_KEYS")),
         gemini_api_key=os.environ.get("GEMINI_API_KEY", "").strip(),
         groq_api_key=os.environ.get("GROQ_API_KEY", "").strip(),
-        gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite").strip(),
-        groq_model=os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant").strip(),
+        gemini_model=os.environ.get("GEMINI_MODEL", "gemini-flash-lite-latest").strip(),
+        groq_model=os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b").strip(),
         local_model=os.environ.get("LOCAL_MODEL", "qwen2.5:3b").strip() or "qwen2.5:3b",
         local_base=os.environ.get("LOCAL_BASE", "http://localhost:11434/v1/chat/completions").strip()
         or "http://localhost:11434/v1/chat/completions",

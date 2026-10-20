@@ -50,6 +50,23 @@ def render(stats, settings, ollama_ok: bool, ollama_models: list, admin_key: str
     connect_html = connect_card(c.get("base", "—"), c.get("ws", "—"), c.get("key", "—"))
     h = hub or {}
     sys = h.get("sys") or {}
+    rd = h.get("rd") or {}
+    rd_sessions = rd.get("sessions") or []
+    if rd_sessions:
+        boxes = "".join(
+            """<div class="connbox"><code id="rd-key-%d">%s</code><span>%d device(s) attached — 2 = phone screen live</span> <button class="copy" onclick="copyVal('rd-key-%d')">Copy</button></div>"""
+            % (i, escape(s["key"]), s["peers"], i)
+            for i, s in enumerate(rd_sessions)
+        )
+        rd_html = """<div class="conn">%s</div>
+<div class="note"><span class="step">Paste on iPhone:</span> ZYRAXIS → Settings → Remote Desktop → key paste karo → <b>Connect to Desktop</b>. Screen tabhi aayegi jab dono taraf (laptop + phone) connected hon — 2 device(s) dikhne chahiye.</div>""" % boxes
+    else:
+        rd_html = """<div class="connbox"><code>no active session</code><span>laptop side se session shuru karo</span></div>
+<div class="note">
+<span class="step">1 ·</span> Laptop ke taskbar tray me ZYRAXIS icon pe right-click → <b>Remote Desktop — session key</b><br>
+<span class="step">2 ·</span> Dialog me jo <b>rd-...</b> key aayegi, wo copy karo (yahi page bhi dikhayega jab laptop connected ho)<br>
+<span class="step">3 ·</span> iPhone → ZYRAXIS → <b>Settings → Remote Desktop</b> → key paste → <b>Connect to Desktop</b>
+</div>"""
     ram = sys.get("ram") or {}
     disks = sys.get("disks") or {}
     da = disks.get("A:\\", {})
@@ -125,6 +142,8 @@ button.copy{padding:5px 12px;font-size:12px;margin:0 0 0 8px}
 </style></head><body>
 <div class="top"><div class="logo">⬡</div><h1>ZYRAXIS Server</h1><div class="dot"></div></div>
 <div class="sub">local control board · auto-refresh 30s · protocol v1</div>
+%s
+<h2>Remote Desktop — phone controls this laptop</h2>
 %s
 <div class="cards">
 <div class="card"><b>%s</b><span>uptime</span></div>
@@ -235,6 +254,7 @@ function copyVal(id){var el=document.getElementById(id);var t=el?el.textContent:
 </script>
 </body></html>""" % (
         connect_html,
+        rd_html,
         escape(stats.uptime()),
         stats.ws_current,
         stats.rest_hits,

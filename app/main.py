@@ -415,8 +415,16 @@ async def admin(request: Request):
         return JSONResponse({"detail": "unauthorized"}, status_code=401)
     ok, models = await _ollama_status()
     key = request.query_params.get("key", "")
+    # Remote-desktop pairing lives on the laptop, but every paired side
+    # announces its session key here — so this page can show which sessions are
+    # live and let the admin copy the key straight into the phone.
+    rd_sessions: dict = {}
+    for session_key in _rd_peers.values():
+        rd_sessions[session_key] = rd_sessions.get(session_key, 0) + 1
     hub = {"memories": len(memory_store.items), "tasks": len(task_store.list("active")),
-           "sys": _system_stats()}
+           "sys": _system_stats(),
+           "rd": {"sessions": [{"key": k, "peers": n} for k, n in rd_sessions.items()],
+                  "peers": len(_rd_peers)}}
     return HTMLResponse(render_admin(stats, settings, ok, models, key, _connect_info(), hub))
 
 
